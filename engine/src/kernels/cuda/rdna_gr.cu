@@ -570,14 +570,21 @@ void rdna_gr_read_multi(const FusedGrArgs* a, int n_tok, float* scratch, void* s
     for (int t = 0; t < n_tok; ++t) m.a[t] = a[t];
     m.part = scratch;
     m.ss = scratch + (size_t) n_tok * 2 * HC * PR;
+    cudaStream_t st = (cudaStream_t) stream;
     int dev = 0;
     if (cudaGetDevice(&dev) == cudaSuccess && dev >= 0 && dev < 64) {
-        if (g_gr_bar[dev] == nullptr && std::getenv("STRATA_GR_FUSED") != nullptr) {
-            if (cudaMalloc(&g_gr_bar[dev], 64) == cudaSuccess) cudaMemset(g_gr_bar[dev], 0, 64);
+        static const bool fused_req = [] {
+            const char* v = std::getenv("STRATA_GR_FUSED");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (fused_req && g_gr_bar[dev] == nullptr) {
+            cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+            if (cudaStreamIsCapturing(st, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone) {
+                if (cudaMalloc(&g_gr_bar[dev], 64) == cudaSuccess) cudaMemset(g_gr_bar[dev], 0, 64);
+            }
         }
         m.bar = g_gr_bar[dev];
     }
-    cudaStream_t st = (cudaStream_t) stream;
     switch (n_tok) {
         case 1: launch_gr<1>(m, st, sb, si, dev); break;
         case 2: launch_gr<2>(m, st, sb, si, dev); break;
