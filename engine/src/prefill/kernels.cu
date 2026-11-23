@@ -196,6 +196,9 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
     float* r = R + row * N;
     const int64_t xo = t * ldx + (int64_t) c * N;
     const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+#if !defined(__HIP_PLATFORM_AMD__)
+    // Upstream #6776: the float4 reduction changes the sum-of-squares tree on gfx11 and drifts JamC-QA answers;
+    // keep AMD HIP on the exact scalar loop below while retaining fused gr_write_norm_rs.
     if constexpr ((N & 3) == 0) {
         if ((((uintptr_t) r | (uintptr_t) (bo + t * N) | (uintptr_t) (w + c * N)) & 15u) == 0 &&
             (((uintptr_t) (xn16 + xo)) & 7u) == 0 && (xn16_lo == nullptr || (((uintptr_t) (xn16_lo + xo)) & 7u) == 0)) {
@@ -240,6 +243,7 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
             return;
         }
     }
+#endif
     float v[GRW_PER];
     float ss = 0.0f;
     int k = 0;
