@@ -16,6 +16,7 @@
 #ifdef __noinline__
 #undef __noinline__
 #endif
+#include "host_lock.hpp"   // mlock GPU-mapped host allocations on Linux (after __noinline__ cleanup for GCC 16)
 #define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeMaxSharedMemoryPerBlock
 #define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 #define cudaDevAttrClockRate hipDeviceAttributeClockRate
@@ -47,11 +48,7 @@
 #define cudaEventSynchronize hipEventSynchronize
 #define cudaEvent_t hipEvent_t
 #define cudaFree hipFree
-#if HIP_VERSION_MAJOR < 7
-#define cudaFreeHost hipHostFree
-#else
-#define cudaFreeHost hipFreeHost
-#endif
+#define cudaFreeHost ::strata::hip_compat::host_free
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaFuncAttributePreferredSharedMemoryCarveout hipFuncAttributePreferredSharedMemoryCarveout
 #define cudaGetDevice hipGetDevice
@@ -145,11 +142,15 @@ inline hipError_t host_alloc(T** pointer, size_t bytes, unsigned int flags = cud
         flags |= hipHostMallocCoherent;
     }
 #endif
-    return hipHostMalloc(reinterpret_cast<void**>(pointer), bytes, flags);
+    const hipError_t e = hipHostMalloc(reinterpret_cast<void**>(pointer), bytes, flags);
+    if (e == hipSuccess) host_lock(reinterpret_cast<void*>(*pointer), bytes);
+    return e;
 }
 template <typename T>
 inline hipError_t malloc_host(T** pointer, size_t bytes) {
-    return hipHostMalloc(reinterpret_cast<void**>(pointer), bytes, hipHostMallocDefault);
+    const hipError_t e = hipHostMalloc(reinterpret_cast<void**>(pointer), bytes, hipHostMallocDefault);
+    if (e == hipSuccess) host_lock(reinterpret_cast<void*>(*pointer), bytes);
+    return e;
 }
 }  // namespace strata::hip_compat
 

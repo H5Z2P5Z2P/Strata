@@ -16288,6 +16288,9 @@ int main(int argc, char** argv) {
             }
         }
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
+#if defined(STRATA_USE_HIP)
+        ::strata::hip_compat::host_lock_report("at READY");
+#endif
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
         std::fflush(stdout);
         std::string line;

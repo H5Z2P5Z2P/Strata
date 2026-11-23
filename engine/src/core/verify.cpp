@@ -572,6 +572,7 @@ bool mapped(size_t bytes, void** h, void** d) {
         if (hipHostMalloc(h, bytes, hipHostMallocMapped | hipHostMallocCoherent |
                                         (peer_portable() ? hipHostMallocPortable : 0)) != hipSuccess)
             return false;
+        ::strata::hip_compat::host_lock(*h, bytes);
         std::memset(*h, 0, bytes);
         return cudaHostGetDevicePointer(d, *h, 0) == cudaSuccess;
     }
