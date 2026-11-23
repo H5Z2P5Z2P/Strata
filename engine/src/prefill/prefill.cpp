@@ -5845,9 +5845,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             } else {
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
-                            for (size_t kk = k0; kk < k; ++kk) {
-                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
-                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                            static const bool pf_slot_events = [] {
+                                const char* v = std::getenv("STRATA_PF_SLOT_EVENTS");
+                                return v != nullptr && v[0] == '1';
+                            }();
+                            if (k > k0 && !pf_slot_events && (k - k0) < (size_t) m.ring) {
+                                const int rel = (int) ((k - 1) % (size_t) m.ring);
+                                cudaEventRecord(m.used[rel], m.cs);
+                                for (size_t kk = k0; kk < k; ++kk) m.used_of[kk % (size_t) m.ring] = rel;
+                            } else {
+                                for (size_t kk = k0; kk < k; ++kk) {
+                                    cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
+                                    m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
+                                }
                             }
                             if (k > k0) {
                                 consumed = k;
