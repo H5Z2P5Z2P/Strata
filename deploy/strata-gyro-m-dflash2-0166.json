@@ -9,7 +9,9 @@
     "--draft-conf",
     "0.5",
     "--spec",
-    "6"
+    "6",
+    "--lookup-max-t",
+    "12"
   ],
   "args": [
     "--pack",
@@ -44,7 +46,9 @@
     "--ple-row-cache",
     "4194304",
     "--vram-reserve-mib",
-    "512"
+    "512",
+    "--pcie-mode",
+    "dma"
   ],
   "cwd": "/home/huaihuai/local-run-ai/Strata-upstream-gyro",
   "tokenizer": "/home/huaihuai/local-run-ai/packs/gyro-m/tokenizer",
@@ -69,6 +73,7 @@
     "STRATA_VERIFY_QDEDUP": "1",
     "STRATA_Q8_PACKED": "0",
     "STRATA_HIP_TQ_SUB8": "1",
+    "STRATA_ADAPT_OVERLAP": "1",
     "GPU_MAX_HW_QUEUES": "8"
   },
   "host": "0.0.0.0",
