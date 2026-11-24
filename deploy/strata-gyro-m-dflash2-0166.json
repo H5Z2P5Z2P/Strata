@@ -9,9 +9,7 @@
     "--draft-conf",
     "0.5",
     "--spec",
-    "6",
-    "--lookup-max-t",
-    "12"
+    "6"
   ],
   "args": [
     "--pack",
