@@ -3743,13 +3743,52 @@ bool tq_stage_on() {
     return per_dev[dev] == 2;
 #endif
 }
+// row chunks per block of the staged trellis gate/up and down kernels (STRATA_TQ_ROWCH, default 4)
+int tq_row_chunks() {
+    static const int n = [] {
+        const char* v = std::getenv("STRATA_TQ_ROWCH");
+        const int k = v != nullptr ? std::atoi(v) : 4;
+        return k < 1 ? 1 : k > 32 ? 32 : k;
+    }();
+    return n;
+}
 // Everywhere but cc 6.0 (tq_stage_on) the trellis kernels stage the codebook too, and the 160-dot gate/up rows are 8-lane rows (4 per
 // warp, 32 per block, row_dot_160_sub8) while the down rows are the staged 8-lane rows above: on an RTX 3060 (Gyro-M, 24 groups of one
 // token) gate/up 221 -> 140 us and down 182 -> 86 us.  Bitwise the same sums as before.  STRATA_TQ_STAGE=0 or STRATA_TQ_SUB8=0 turn it off
-// (CUDA only: the AMD builds keep the old kernels), STRATA_IQ_STAGE_GRID=0 as for every staged table.
+// (CUDA on by default; HIP opt-in via STRATA_HIP_TQ_SUB8=1 on gfx1100 wave32), STRATA_IQ_STAGE_GRID=0 as for every staged table.
 bool tq_sub8_on() {
 #if defined(__HIPCC__)
-    return false;
+    static const bool requested = [] {
+        const char* v = std::getenv("STRATA_HIP_TQ_SUB8");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!requested) return false;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { cudaGetLastError(); return false; }
+    static thread_local int checked = -1;
+    static thread_local bool compatible = false;
+    static thread_local char arch_name[64] = {};
+    if (checked != device) {
+        cudaDeviceProp props{};
+        compatible = cudaGetDeviceProperties(&props, device) == cudaSuccess &&
+                     std::strncmp(props.gcnArchName, "gfx1100", 7) == 0 && props.warpSize == 32;
+        if (compatible) {
+            std::strncpy(arch_name, props.gcnArchName, sizeof(arch_name) - 1);
+            arch_name[sizeof(arch_name) - 1] = '\0';
+        }
+        checked = device;
+    }
+    const char* stage = std::getenv("STRATA_TQ_STAGE");
+    const char* sub8 = std::getenv("STRATA_TQ_SUB8");
+    const bool ok = compatible && !(stage && stage[0] == '0') && !(sub8 && sub8[0] == '0') &&
+                    g_stage_grid && !g_no_sub16_gu && !tq_stage_on();
+    static bool noted = false;
+    if (ok && !noted) {
+        noted = true;
+        std::fprintf(stderr, "strata tq-sub8: CUDA%d enabled on %s (STRATA_HIP_TQ_SUB8=1, rowch=%d)\n",
+                     device, arch_name, tq_row_chunks());
+    }
+    return ok;
 #else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_TQ_STAGE");
@@ -3759,15 +3798,6 @@ bool tq_sub8_on() {
     }();
     return on && g_stage_grid && !g_no_sub16_gu && !tq_stage_on();
 #endif
-}
-// row chunks per block of the staged trellis gate/up and down kernels (STRATA_TQ_ROWCH, default 4)
-int tq_row_chunks() {
-    static const int n = [] {
-        const char* v = std::getenv("STRATA_TQ_ROWCH");
-        const int k = v != nullptr ? std::atoi(v) : 4;
-        return k < 1 ? 1 : k > 32 ? 32 : k;
-    }();
-    return n;
 }
 
 template<int TY, bool STAGE_GRID = kStageIqGrid<TY>>
