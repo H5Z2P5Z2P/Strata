@@ -39,7 +39,9 @@
     "--ple-row-cache",
     "4194304",
     "--vram-reserve-mib",
-    "640"
+    "640",
+    "--pcie-mode",
+    "dma"
   ],
   "cwd": "/home/huaihuai/local-run-ai/Strata-upstream-gyro",
   "tokenizer": "/home/huaihuai/local-run-ai/packs/ista-iq3_s/tokenizer",
@@ -62,6 +64,7 @@
     "STRATA_SPEC_COUPLED": "1",
     "STRATA_KV_HOST_DMA": "1",
     "STRATA_VERIFY_QDEDUP": "1",
+    "STRATA_ADAPT_OVERLAP": "1",
     "GPU_MAX_HW_QUEUES": "8"
   },
   "host": "0.0.0.0",
