@@ -3055,7 +3055,7 @@ __device__ __forceinline__ void ed_gu_tq2_rows(const uint8_t* const* wr, const i
 #pragma unroll
             for (int c = 0; c < NC; ++c) p[v][r][c] = 0.0f;
     const int th = t & 1, t2 = t >> 1;
-#pragma unroll
+#pragma unroll 1
     for (int j = 0; j < 5; ++j) {
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
@@ -3084,7 +3084,12 @@ __device__ __forceinline__ void ed_gu_tq2_rows(const uint8_t* const* wr, const i
 }
 
 template<int R>
-__global__ void __launch_bounds__(256) expdec_gu_tq2_kernel(const unsigned long long* __restrict__ grp_ptr,
+#if defined(__HIPCC__)
+__global__ void __launch_bounds__(256, R == 1 ? 8 : 6) expdec_gu_tq2_kernel(
+#else
+__global__ void __launch_bounds__(256) expdec_gu_tq2_kernel(
+#endif
+                                                            const unsigned long long* __restrict__ grp_ptr,
                                                             const int32_t* __restrict__ grp_start,
                                                             const int32_t* __restrict__ n_groups,
                                                             const int32_t* __restrict__ ent_tok,
@@ -3233,7 +3238,12 @@ __device__ __forceinline__ void ed_down_tq2_rows(const uint8_t* const* wr, const
 }
 
 template<int R>
-__global__ void __launch_bounds__(256) expdec_down_tq2_kernel(const unsigned long long* __restrict__ grp_ptr,
+#if defined(__HIPCC__)
+__global__ void __launch_bounds__(256, R == 1 ? 8 : 6) expdec_down_tq2_kernel(
+#else
+__global__ void __launch_bounds__(256) expdec_down_tq2_kernel(
+#endif
+                                                              const unsigned long long* __restrict__ grp_ptr,
                                                               const int32_t* __restrict__ grp_start,
                                                               const int32_t* __restrict__ n_groups,
                                                               const int32_t* __restrict__ ent_dst,
@@ -6239,16 +6249,26 @@ void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, cons
 }
 
 bool hip_had_fuse_on() {
-    static const bool on = [] {
+    static const bool requested = [] {
         const char* v = std::getenv("STRATA_HIP_HAD_FUSE");
         return v != nullptr && v[0] == '1';
     }();
+    if (!requested) return false;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { cudaGetLastError(); return false; }
+    static thread_local int checked = -1;
+    static thread_local bool wave32 = false;
+    if (checked != device) {
+        cudaDeviceProp props{};
+        wave32 = cudaGetDeviceProperties(&props, device) == cudaSuccess && props.warpSize == 32;
+        checked = device;
+    }
     static bool noted = false;
-    if (on && !noted) {
+    if (wave32 && !noted) {
         noted = true;
         std::fprintf(stderr, "strata had-fuse: fused block-128 Hadamard+Q8_1 enabled (STRATA_HIP_HAD_FUSE=1)\n");
     }
-    return on;
+    return wave32;
 }
 
 void hadamard128_q8_1_rows(const float* x, int64_t rows, int64_t width, const float* signs, void* y_q8_1, void* stream) {
@@ -7803,7 +7823,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool sw_v1 = v1;
 #endif
     // APR: Hadamard-folded down weights take the rotated h; STRATA_HIP_HAD_FUSE=1 fuses SwiGLU + block-128 Hadamard + Q8_1
-    if (!sw_v1 && L.had_block == 128 && (L.n_ff % 128 == 0) && hip_had_fuse_on()) {
+    if (!sw_v1 && cap_entries > 0 && L.had_block == 128 && (L.n_ff % 128 == 0) && hip_had_fuse_on()) {
         swiglu_hadamard128_q8_1_entries_kernel<<<dim3((unsigned) (L.n_ff / 128), (unsigned) cap_entries), 128, 0, s>>>(
             gate, up, grp_start, n_groups, (int) L.n_ff, L.d_signs, 1.0f / std::sqrt(128.0f), hq);
     } else if (sw_v1 || L.had_block > 0) {
