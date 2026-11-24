@@ -63,6 +63,7 @@
     "STRATA_KV_HOST_DMA": "1",
     "STRATA_VERIFY_QDEDUP": "1",
     "STRATA_Q8_PACKED": "0",
+    "STRATA_HIP_TQ_SUB8": "1",
     "GPU_MAX_HW_QUEUES": "8"
   },
   "host": "0.0.0.0",
