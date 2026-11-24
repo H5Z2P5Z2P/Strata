@@ -27,7 +27,7 @@
     "--spec-min-p",
     "0.5",
     "--pool-workers",
-    "8",
+    "6",
     "--adapt-every",
     "1",
     "--adapt-swaps",

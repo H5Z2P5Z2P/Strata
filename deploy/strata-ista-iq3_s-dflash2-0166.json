@@ -34,7 +34,7 @@
     "32768",
     "--vision",
     "--pool-workers",
-    "8",
+    "6",
     "--adapt-every",
     "1",
     "--adapt-swaps",
