@@ -2766,8 +2766,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // always rewrites it from the rotated rows (same stream, after the shared expert has read it).
             const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
             if (f.had_gu) {   // nat_xr_ exists: init carved it because this layer is folded (had_gu_any)
-                hadamard_rows(xm, nat_xr_ + (size_t) tb * N, n, N, f.had_block, had_sx_, cs);
-                quantize_q8_1_rows(nat_xr_ + (size_t) tb * N, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                if (f.had_block == 128 && (N % 128 == 0) && strata::kernels::hip_had_fuse_on()) {
+                    strata::kernels::hadamard128_q8_1_rows(xm, n, N, had_sx_, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                } else {
+                    hadamard_rows(xm, nat_xr_ + (size_t) tb * N, n, N, f.had_block, had_sx_, cs);
+                    quantize_q8_1_rows(nat_xr_ + (size_t) tb * N, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                }
             } else if (!qdedup && !q8_ffn) {
                 quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
             }

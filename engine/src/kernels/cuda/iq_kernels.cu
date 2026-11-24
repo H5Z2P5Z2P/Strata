@@ -3013,6 +3013,286 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
     }
 }
 
+// ---------------------------------------------------------------- EXPDEC-TQ2_T (STRATA_HIP_EXPDEC_TQ=1):
+// Gyro-M TQ2_T (144) on gfx1100 wave32: 4 KiB LDS codebook + planar 16-byte LDS activations (ed_stage_entry) +
+// R rows per 8-lane sub-warp + wave32 shuffle for the wrap-around prev byte (eliminates unaligned 1-byte load).
+// Bitwise identical to row_dot_160_sub8 (gate/up) and row_dot_40_sub8 (down).
+__device__ __forceinline__ TqLane tq2_load_shfl(const void* __restrict__ vbq, int kbx, int t, int prev_lane,
+                                                const uint16_t* __restrict__ s_lut) {
+    const block_tq2_t* b = (const block_tq2_t*) vbq + kbx;
+    const uint16_t* qs16 = (const uint16_t*) b->qs;
+    const uint32_t w01 = STRATA_TQ_LD16(qs16 + 2 * t + 0), w23 = STRATA_TQ_LD16(qs16 + 2 * t + 1);
+    const uint32_t b0 = w01 & 0xFFu, b1 = w01 >> 8, b2 = w23 & 0xFFu, b3 = w23 >> 8;
+    const uint32_t prev = __shfl_sync(0xffffffffu, b3, prev_lane);
+    const uint32_t s[4] = { (prev << 8) | b0, (b0 << 8) | b1, (b1 << 8) | b2, (b2 << 8) | b3 };
+    TqLane r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+        r.q[i] = (int) ((uint32_t) s_lut[x >> 21] | ((uint32_t) s_lut[(x >> 10) & 2047u] << 16));
+    }
+    r.d = tq_h2f(STRATA_TQ_LD16(&b->d));
+    return r;
+}
+__device__ __forceinline__ float tq_apply_u(const TqLane& r, const int4 u, float d8) {
+    int sumi = 0;
+    sumi = ggml_cuda_dp4a(r.q[0], u.x, sumi);
+    sumi = ggml_cuda_dp4a(r.q[1], u.y, sumi);
+    sumi = ggml_cuda_dp4a(r.q[2], u.z, sumi);
+    sumi = ggml_cuda_dp4a(r.q[3], u.w, sumi);
+    return r.d * (d8 * TQ_LUT_I8_SCALE) * (float) sumi;
+}
+
+template<int R, int NC>
+__device__ __forceinline__ void ed_gu_tq2_rows(const uint8_t* const* wr, const int4* __restrict__ s_u,
+                                               const float* __restrict__ s_ds, const uint16_t* __restrict__ s_lut,
+                                               int t, int prev_lane, float (&s)[R][NC]) {
+    float p[4][R][NC];
+#pragma unroll
+    for (int v = 0; v < 4; ++v)
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int c = 0; c < NC; ++c) p[v][r][c] = 0.0f;
+    const int th = t & 1, t2 = t >> 1;
+#pragma unroll
+    for (int j = 0; j < 5; ++j) {
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            const int kbx = v + 4 * j;
+            const int bk = kbx * 4 + t2;
+            TqLane w[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) w[r] = tq2_load_shfl(wr[r], kbx, t, prev_lane, s_lut);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const int4 u = s_u[(c * 2 + th) * ED_XB + bk];
+                const float d8 = s_ds[c * ED_XB + bk];
+#pragma unroll
+                for (int r = 0; r < R; ++r) p[v][r][c] += tq_apply_u(w[r], u, d8);
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            s[r][c] = __fadd_rn(__fadd_rn(p[0][r][c], p[2][r][c]), __fadd_rn(p[1][r][c], p[3][r][c]));
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[r][c] += __shfl_xor_sync(0xffffffffu, s[r][c], o);
+        }
+}
+
+template<int R>
+__global__ void __launch_bounds__(256) expdec_gu_tq2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                            const int32_t* __restrict__ grp_start,
+                                                            const int32_t* __restrict__ n_groups,
+                                                            const int32_t* __restrict__ ent_tok,
+                                                            const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                            float* __restrict__ gate, float* __restrict__ up, int rb) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    STRATA_SHARED_ALIGN16(int4, s_u, ED_NC * 2 * ED_XB);
+    __shared__ float s_ds[ED_NC * ED_XB];
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, 1024);
+    const int tid = threadIdx.x;
+    {
+        const uint2* src = (const uint2*) tq_lut_i8;
+        uint2* dst = (uint2*) s_grid_buf;
+        for (int i = tid; i < 512; i += 256) dst[i] = src[i];
+    }
+    const uint16_t* s_lut = (const uint16_t*) s_grid_buf;
+    const int sw = tid >> 3, t = tid & 7, lane = tid & 31;
+    const int prev_lane = (lane & ~7) | ((t + 7) & 7);
+    const int nrow = 2 * (int) L.n_ff, n_ff = (int) L.n_ff;
+    const int row_base = (int) blockIdx.x * rb;
+    constexpr int RPP = 32 * R;
+    for (int g = (int) blockIdx.y; g < ng; g += (int) gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += ED_NC) {
+            const int n = min(ED_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int c = 0; c < n; ++c) ed_stage_entry<ED_XB, true>(s_u, s_ds, c, xq + (size_t) ent_tok[e + c] * ED_XB, tid);
+            iq_sync_lds();
+            for (int p = 0; p * RPP < rb; ++p) {
+                const int row0 = row_base + p * RPP + sw * R;
+                if (row0 >= nrow) break;
+                const bool is_up = row0 >= n_ff;
+                const int r0 = is_up ? row0 - n_ff : row0;
+                const uint8_t* wr[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) wr[r] = blob + (is_up ? L.up_off : 0) + (size_t) (r0 + r) * L.gu_row;
+                float* dst = is_up ? up : gate;
+                auto run = [&](auto nc) {
+                    constexpr int NC = decltype(nc)::value;
+                    float s[R][NC];
+                    ed_gu_tq2_rows<R, NC>(wr, s_u, s_ds, s_lut, t, prev_lane, s);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (t == c)
+#pragma unroll
+                            for (int r = 0; r < R; ++r) dst[(size_t) (e + c) * n_ff + r0 + r] = s[r][c];
+                };
+                switch (n) {
+                    case 1: run(std::integral_constant<int, 1>{}); break;
+                    case 2: run(std::integral_constant<int, 2>{}); break;
+                    case 3: run(std::integral_constant<int, 3>{}); break;
+                    default: run(std::integral_constant<int, 4>{}); break;
+                }
+            }
+        }
+    }
+}
+
+template<int R, int NC>
+__device__ __forceinline__ void ed_down_tq2_rows(const uint8_t* const* wr, const int4* __restrict__ s_u,
+                                                 const float* __restrict__ s_ds, const uint16_t* __restrict__ s_lut,
+                                                 int t, int prev_lane, float (&s)[R][NC]) {
+    const int th = t & 1, t2 = t >> 1;
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) s[r][c] = 0.0f;
+    // k = t (kbx = 0) and k = t + 32 (kbx = 4)
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int kbx = 4 * j, bk = kbx * 4 + t2;
+        TqLane w[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) w[r] = tq2_load_shfl(wr[r], kbx, t, prev_lane, s_lut);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int4 u = s_u[(c * 2 + th) * ED_HB + bk];
+            const float d8 = s_ds[c * ED_HB + bk];
+#pragma unroll
+            for (int r = 0; r < R; ++r) s[r][c] += tq_apply_u(w[r], u, d8);
+        }
+    }
+    // k = t + 16 (kbx = 2)
+    {
+        const int bk = 2 * 4 + t2;
+        TqLane w[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) w[r] = tq2_load_shfl(wr[r], 2, t, prev_lane, s_lut);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int4 u = s_u[(c * 2 + th) * ED_HB + bk];
+            const float d8 = s_ds[c * ED_HB + bk];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float s16 = 0.0f;
+                s16 += tq_apply_u(w[r], u, d8);
+                s[r][c] = __fadd_rn(s[r][c], s16);
+            }
+        }
+    }
+    // k = t + 8 (kbx = 1)
+    float s8[R][NC];
+    {
+        const int bk = 1 * 4 + t2;
+        TqLane w[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) w[r] = tq2_load_shfl(wr[r], 1, t, prev_lane, s_lut);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int4 u = s_u[(c * 2 + th) * ED_HB + bk];
+            const float d8 = s_ds[c * ED_HB + bk];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                s8[r][c] = 0.0f;
+                s8[r][c] += tq_apply_u(w[r], u, d8);
+            }
+        }
+    }
+    // k = t + 24 (kbx = 3)
+    {
+        const int bk = 3 * 4 + t2;
+        TqLane w[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) w[r] = tq2_load_shfl(wr[r], 3, t, prev_lane, s_lut);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const int4 u = s_u[(c * 2 + th) * ED_HB + bk];
+            const float d8 = s_ds[c * ED_HB + bk];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                float s24 = 0.0f;
+                s24 += tq_apply_u(w[r], u, d8);
+                s[r][c] = __fadd_rn(s[r][c], __fadd_rn(s8[r][c], s24));
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+#pragma unroll
+            for (int o = 4; o > 0; o >>= 1) s[r][c] += __shfl_xor_sync(0xffffffffu, s[r][c], o);
+        }
+}
+
+template<int R>
+__global__ void __launch_bounds__(256) expdec_down_tq2_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                              const int32_t* __restrict__ grp_start,
+                                                              const int32_t* __restrict__ n_groups,
+                                                              const int32_t* __restrict__ ent_dst,
+                                                              const block_q8_1* __restrict__ hq, NativeExpertLayout L,
+                                                              float* __restrict__ out, int rb) {
+    const int ng = *n_groups;
+    if ((int) blockIdx.y >= ng) return;
+    STRATA_SHARED_ALIGN16(int4, s_u, ED_NC * 2 * ED_HB);
+    __shared__ float s_ds[ED_NC * ED_HB];
+    STRATA_SHARED_ALIGN16_U32(s_grid_buf, 1024);
+    const int tid = threadIdx.x;
+    {
+        const uint2* src = (const uint2*) tq_lut_i8;
+        uint2* dst = (uint2*) s_grid_buf;
+        for (int i = tid; i < 512; i += 256) dst[i] = src[i];
+    }
+    const uint16_t* s_lut = (const uint16_t*) s_grid_buf;
+    const int sw = tid >> 3, t = tid & 7, lane = tid & 31;
+    const int prev_lane = (lane & ~7) | ((t + 7) & 7);
+    const int nrow = (int) L.n_embd;
+    const int row_base = (int) blockIdx.x * rb;
+    constexpr int RPP = 32 * R;
+    for (int g = (int) blockIdx.y; g < ng; g += (int) gridDim.y) {
+        const uint8_t* blob = (const uint8_t*) grp_ptr[g] + L.down_off;
+        const int e0 = grp_start[g], e1 = grp_start[g + 1];
+        for (int e = e0; e < e1; e += ED_NC) {
+            const int n = min(ED_NC, e1 - e);
+            if (g > (int) blockIdx.y || e > e0) iq_sync_lds();
+            for (int c = 0; c < n; ++c) ed_stage_entry<ED_HB, true>(s_u, s_ds, c, hq + (size_t) (e + c) * ED_HB, tid);
+            iq_sync_lds();
+            for (int p = 0; p * RPP < rb; ++p) {
+                const int row0 = row_base + p * RPP + sw * R;
+                if (row0 >= nrow) break;
+                const uint8_t* wr[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) wr[r] = blob + (size_t) (row0 + r) * L.d_row;
+                auto run = [&](auto nc) {
+                    constexpr int NC = decltype(nc)::value;
+                    float s[R][NC];
+                    ed_down_tq2_rows<R, NC>(wr, s_u, s_ds, s_lut, t, prev_lane, s);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c)
+                        if (t == c) {
+                            const size_t o = (size_t) ent_dst[e + c] * L.n_embd + row0;
+#pragma unroll
+                            for (int r = 0; r < R; ++r) out[o + r] = s[r][c];
+                        }
+                };
+                switch (n) {
+                    case 1: run(std::integral_constant<int, 1>{}); break;
+                    case 2: run(std::integral_constant<int, 2>{}); break;
+                    case 3: run(std::integral_constant<int, 3>{}); break;
+                    default: run(std::integral_constant<int, 4>{}); break;
+                }
+            }
+        }
+    }
+}
+
 // STRATA_SM86_DOWN_WS: zero-spill (REG:64, STACK:0, 2,880 B smem) IQ4_NL down kernel for sm_86.
 // Eliminates native_down_multi_kernel<20>'s 64-byte stack spill by staging up to ED_NC=4 q8_1 hidden rows
 // (n_ff = 640 -> ED_HB = 20 blocks) in shared memory and running 32 sub-warps of 8 lanes via ed_d20_rows<1, NC>.
@@ -3085,6 +3365,77 @@ __global__ void quantize_q8_1_kernel(const float* __restrict__ x, block_q8_1* __
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     q8_1_store(x[i], y, i);
+}
+
+// Opt-in (STRATA_HIP_HAD_FUSE=1): block-128 Hadamard rotation + Q8_1 quantization in one launch (4 wave32 per block).
+// Matches hadamard_rows_kernel<float> + quantize_q8_1_kernel bit for bit (same butterfly order and fp contract off).
+__global__ void __launch_bounds__(128) hadamard128_q8_1_rows_kernel(const float* __restrict__ x, int64_t width,
+                                                                    const float* __restrict__ signs, float scale,
+                                                                    block_q8_1* __restrict__ y) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+    __shared__ float hbuf[128];
+    const int i = threadIdx.x;
+    const int64_t col = (int64_t) blockIdx.x * 128 + i;
+    const int64_t at = (int64_t) blockIdx.y * width + col;
+    float v = x[at];
+    if (signs) v *= signs[col];
+    hbuf[i] = v;
+#pragma unroll
+    for (int len = 1; len < 128; len <<= 1) {
+        __syncthreads();
+        if ((i & len) == 0) {
+            const float a = hbuf[i], c = hbuf[i + len];
+            hbuf[i] = a + c;
+            hbuf[i + len] = a - c;
+        }
+    }
+    __syncthreads();
+    const float vr = hbuf[i] * scale;
+    q8_1_store(vr, y, at);
+}
+
+// Opt-in (STRATA_HIP_HAD_FUSE=1): SwiGLU + block-128 Hadamard + Q8_1 quantization in one launch over active entries
+// [grp_start[0], grp_start[*n_groups]) only, eliminating intermediate global h round-trips and 2 launches per layer.
+__global__ void __launch_bounds__(128) swiglu_hadamard128_q8_1_entries_kernel(const float* __restrict__ gate,
+                                                                              const float* __restrict__ up,
+                                                                              const int32_t* __restrict__ grp_start,
+                                                                              const int32_t* __restrict__ n_groups,
+                                                                              int n_ff,
+                                                                              const float* __restrict__ signs,
+                                                                              float scale,
+                                                                              block_q8_1* __restrict__ hq) {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+    const int e0 = grp_start[0], e1 = grp_start[*n_groups];
+    const int e = e0 + (int) blockIdx.y;
+    if (e >= e1) return;
+    __shared__ float hbuf[128];
+    const int i = threadIdx.x;
+    const int col = (int) blockIdx.x * 128 + i;
+    const long long at = (long long) e * n_ff + col;
+    const float g = gate[at];
+#if defined(__HIPCC__)
+    float v = (g / (1.0f + __expf(-g))) * up[at];
+#else
+    float v = __fmul_rn(g / (1.0f + __expf(-g)), up[at]);
+#endif
+    if (signs) v *= signs[col];
+    hbuf[i] = v;
+#pragma unroll
+    for (int len = 1; len < 128; len <<= 1) {
+        __syncthreads();
+        if ((i & len) == 0) {
+            const float a = hbuf[i], c = hbuf[i + len];
+            hbuf[i] = a + c;
+            hbuf[i + len] = a - c;
+        }
+    }
+    __syncthreads();
+    const float vr = hbuf[i] * scale;
+    q8_1_store(vr, hq, at);
 }
 
 // swiglu_entries_kernel and quantize_q8_1_kernel in one pass, over the call's own entries only:
@@ -4479,10 +4830,79 @@ void expdec_note(const NativeExpertLayout& L, bool gu, bool taken, cudaStream_t 
     }
 }
 
+#if defined(__HIPCC__)
+bool hip_expdec_tq_on() {
+    static const bool requested = [] {
+        const char* v = std::getenv("STRATA_HIP_EXPDEC_TQ");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!requested) return false;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { cudaGetLastError(); return false; }
+    static thread_local int checked = -1;
+    static thread_local bool compatible = false;
+    if (checked != device) {
+        cudaDeviceProp props{};
+        compatible = cudaGetDeviceProperties(&props, device) == cudaSuccess &&
+                     std::strncmp(props.gcnArchName, "gfx1100", 7) == 0 && props.warpSize == 32;
+        checked = device;
+    }
+    return compatible && g_stage_grid && !g_no_sub16_gu;
+}
+bool expdec_tq2_gu(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cudaStream_t s,
+                   const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                   const int32_t* ent_tok, const block_q8_1* X, float* gate, float* up) {
+    if (!hip_expdec_tq_on() || g_old_kernels) return false;
+    static const bool en = env_int_or("STRATA_HIP_EXPDEC_TQ_GU", 1) != 0;
+    if (!en || L.gu_type != 144 || L.tail_off != 0 || L.n_embd != 32 * ED_XB || L.n_ff % 64 != 0 || L.n_ff <= 0) return false;
+    static const int r_cfg = env_int_or("STRATA_HIP_EXPDEC_TQ_R", 2);
+    static const int rb_cfg = env_int_or("STRATA_HIP_EXPDEC_TQ_RB", 0);
+    const int R = (r_cfg == 1) ? 1 : 2;
+    const int nrow = 2 * (int) L.n_ff;
+    const int rb = expdec_rows_per_block(nrow, 32 * R, cap_groups, rb_cfg);
+    const dim3 grid((unsigned) ((nrow + rb - 1) / rb), (unsigned) gy);
+    static bool noted = false;
+    if (!noted) {
+        noted = true;
+        std::fprintf(stderr, "strata expdec-tq2: gate/up R=%d rb=%d grid=%dx%lld (STRATA_HIP_EXPDEC_TQ=1)\n",
+                     R, rb, (int) grid.x, (long long) gy);
+    }
+    if (R == 1) expdec_gu_tq2_kernel<1><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb);
+    else expdec_gu_tq2_kernel<2><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, rb);
+    return true;
+}
+bool expdec_tq2_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cudaStream_t s,
+                     const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                     const int32_t* ent_dst, const block_q8_1* hq, float* out) {
+    if (!hip_expdec_tq_on() || g_old_kernels) return false;
+    static const bool en = env_int_or("STRATA_HIP_EXPDEC_TQ_DOWN", 1) != 0;
+    if (!en || L.d_type != 144 || L.tail_off != 0 || L.n_ff != 32 * ED_HB || L.n_embd % 128 != 0 || L.n_embd <= 0) return false;
+    static const int dr_cfg = env_int_or("STRATA_HIP_EXPDEC_TQ_DR", 2);
+    static const int drb_cfg = env_int_or("STRATA_HIP_EXPDEC_TQ_DRB", 0);
+    const int R = (dr_cfg == 1 || dr_cfg == 4) ? dr_cfg : 2;
+    const int nrow = (int) L.n_embd;
+    const int rb = expdec_rows_per_block(nrow, 32 * R, cap_groups, drb_cfg);
+    const dim3 grid((unsigned) ((nrow + rb - 1) / rb), (unsigned) gy);
+    static bool noted = false;
+    if (!noted) {
+        noted = true;
+        std::fprintf(stderr, "strata expdec-tq2: down R=%d rb=%d grid=%dx%lld (STRATA_HIP_EXPDEC_TQ=1)\n",
+                     R, rb, (int) grid.x, (long long) gy);
+    }
+    if (R == 1) expdec_down_tq2_kernel<1><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb);
+    else if (R == 2) expdec_down_tq2_kernel<2><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb);
+    else expdec_down_tq2_kernel<4><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out, rb);
+    return true;
+}
+#endif
+
 // false: EXPDEC is off or does not take this layout (the caller launches the default kernels)
 bool expdec_gu(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr,
                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, float* gate,
                float* up) {
+#if defined(__HIPCC__)
+    if (expdec_tq2_gu(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_tok, X, gate, up)) return true;
+#endif
     if (!expdec_mode() || g_old_kernels) return false;
     if (!expdec_gu_ok(L)) { expdec_note(L, true, false, s, gy, cap_groups); return false; }
     expdec_note(L, true, true, s, gy, cap_groups);
@@ -4515,6 +4935,9 @@ void expdec_down_t(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigne
 }
 bool expdec_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned long long* grp_ptr,
                  const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, float* out) {
+#if defined(__HIPCC__)
+    if (expdec_tq2_down(L, gy, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, hq, out)) return true;
+#endif
     if (!expdec_mode() || g_old_kernels) return false;
     if (!expdec_down_ok(L)) { expdec_note(L, false, false, s, gy, cap_groups); return false; }
     expdec_note(L, false, true, s, gy, cap_groups);
@@ -5813,6 +6236,31 @@ void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, cons
                                                                 width, signs, 1.0f / std::sqrt((float) block));
     }
     check("hadamard_rows_f16");
+}
+
+bool hip_had_fuse_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_HIP_HAD_FUSE");
+        return v != nullptr && v[0] == '1';
+    }();
+    static bool noted = false;
+    if (on && !noted) {
+        noted = true;
+        std::fprintf(stderr, "strata had-fuse: fused block-128 Hadamard+Q8_1 enabled (STRATA_HIP_HAD_FUSE=1)\n");
+    }
+    return on;
+}
+
+void hadamard128_q8_1_rows(const float* x, int64_t rows, int64_t width, const float* signs, void* y_q8_1, void* stream) {
+    if (rows <= 0) return;
+    if (width % 128 != 0) hadamard_bad_block("hadamard128_q8_1_rows", 128, width);
+    const float scale = 1.0f / std::sqrt(128.0f);
+    for (int64_t r0 = 0; r0 < rows; r0 += kHadamardMaxRows) {
+        const int64_t n = std::min<int64_t>(kHadamardMaxRows, rows - r0);
+        hadamard128_q8_1_rows_kernel<<<dim3((unsigned) (width / 128), (unsigned) n), 128, 0, (cudaStream_t) stream>>>(
+            x + r0 * width, width, signs, scale, (block_q8_1*) y_q8_1 + r0 * (width / 32));
+    }
+    check("hadamard128_q8_1_rows");
 }
 
 const float* hadamard_device_signs(const float* host, int width) {
@@ -7354,8 +7802,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool sw_v1 = v1;
 #endif
-    // APR: Hadamard-folded down weights take the rotated h, so h exists as floats first (the separate passes)
-    if (sw_v1 || L.had_block > 0) {
+    // APR: Hadamard-folded down weights take the rotated h; STRATA_HIP_HAD_FUSE=1 fuses SwiGLU + block-128 Hadamard + Q8_1
+    if (!sw_v1 && L.had_block == 128 && (L.n_ff % 128 == 0) && hip_had_fuse_on()) {
+        swiglu_hadamard128_q8_1_entries_kernel<<<dim3((unsigned) (L.n_ff / 128), (unsigned) cap_entries), 128, 0, s>>>(
+            gate, up, grp_start, n_groups, (int) L.n_ff, L.d_signs, 1.0f / std::sqrt(128.0f), hq);
+    } else if (sw_v1 || L.had_block > 0) {
         swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
         if (L.had_block > 0)   // APR: the down weights are Hadamard-folded, so is their input (in place, every entry row)
             hadamard_rows(h, h, cap_entries, L.n_ff, L.had_block, L.d_signs, s);

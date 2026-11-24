@@ -40,6 +40,23 @@
 namespace cpu = strata::kernels::cpu;
 namespace K = strata::kernels;
 
+namespace {
+const char* bench_type_name(int t) {
+    switch (t) {
+        case 144: return "tq2_t";
+        case 145: return "tqk6";
+        case 146: return "tqk7";
+        case 147: return "tqp5";
+        case 148: return "tqp6";
+        case 149: return "tqp7";
+        default: {
+            const char* n = ggml_type_name((ggml_type) t);
+            return n != nullptr ? n : "unknown";
+        }
+    }
+}
+}  // namespace
+
 int nibble_main(int argc, char** argv);
 
 int main(int argc, char** argv) {
@@ -175,7 +192,7 @@ int main(int argc, char** argv) {
         std::printf("hash %016llx\n", (unsigned long long) fnv);
         std::printf("layer %2d %-7s/%-6s G %d T %d | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)"
                     " | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s) | %s\n",
-                    l, ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), G, T,
+                    l, bench_type_name(f.gu_type), bench_type_name(f.d_type), G, T,
                     mref, us[0][0], us[0][1], gu_b / us[0][1] / 1e3, us[0][2], d_b / us[0][2] / 1e3,
                     mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3,
                     ndiff ? "DIFFERS" : "bitwise equal");
@@ -378,7 +395,7 @@ int nibble_main(int argc, char** argv) {
         c.on = true;
         const nib::LayerVram V = nib::plan_layer(l, f, c);
         if (!V.on) {
-            std::printf("layer %d: %s is not converted\n", l, ggml_type_name((ggml_type) f.gu_type));
+            std::printf("layer %d: %s is not converted\n", l, bench_type_name(f.gu_type));
             continue;
         }
         // the 512 blobs (P) and their 4-bit slots (N, the engine's transcoder)

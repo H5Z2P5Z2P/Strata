@@ -157,6 +157,9 @@ void native_expert_set_mode(int mode, int phase);
 /// hadamard_rotate.  The f16 form rotates in place, computing in float.
 void hadamard_rows(const float* x, float* y, int64_t rows, int64_t width, int block, const float* signs, void* stream);
 void hadamard_rows_f16(uint16_t* x, int64_t rows, int64_t width, int block, const float* signs, void* stream);
+/// Opt-in (STRATA_HIP_HAD_FUSE=1): fused block-128 Hadamard + Q8_1 quantization (bitwise equal to hadamard_rows + quantize_q8_1_rows).
+bool hip_had_fuse_on();
+void hadamard128_q8_1_rows(const float* x, int64_t rows, int64_t width, const float* signs, void* y_q8_1, void* stream);
 /// A device copy (on the current device) of the host sign vector `host` of `width` signs, made on first use and
 /// kept for the process.  Call it at setup, not inside a CUDA graph capture.  nullptr for a nullptr `host`.
 const float* hadamard_device_signs(const float* host, int width);
