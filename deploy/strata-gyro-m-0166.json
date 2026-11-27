@@ -59,6 +59,7 @@
     "STRATA_HIPBLASLT_TABLE": "on",
     "STRATA_HIPBLASLT_TUNING": "/home/huaihuai/local-run-ai/Strata-upstream-gyro/terminal/tools/hip/gfx1100-hipblaslt-100401.txt",
     "STRATA_GFX11_CHUNK": "16",
+    "STRATA_PREFILL_RING": "384",
     "STRATA_PREFILL_COPY_WAIT_DEDUPE": "1",
     "STRATA_PREFILL_COPY_EVENT_EVERY": "128",
     "STRATA_SPEC_COUPLED": "1",
