@@ -785,6 +785,27 @@ __device__ __forceinline__ TqLane tq_load(const void* __restrict__ vbq, int kbx,
     r.d = tq_h2f(STRATA_TQ_LD16(&b->d));
     return r;
 }
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+// Wave32 shuffle-based TQ2_T load: eliminates the unaligned 1-byte wrap-around global load per block.
+// Bitwise identical to tq_load<144, true> on 8-lane sub-warps (prev_lane = (lane & ~7) | ((t + 7) & 7)).
+__device__ __forceinline__ TqLane tq2_load_shfl(const void* __restrict__ vbq, int kbx, int t, int prev_lane,
+                                                const uint16_t* __restrict__ s_lut) {
+    const block_tq2_t* b = (const block_tq2_t*) vbq + kbx;
+    const uint16_t* qs16 = (const uint16_t*) b->qs;
+    const uint32_t w01 = STRATA_TQ_LD16(qs16 + 2 * t + 0), w23 = STRATA_TQ_LD16(qs16 + 2 * t + 1);
+    const uint32_t b0 = w01 & 0xFFu, b1 = w01 >> 8, b2 = w23 & 0xFFu, b3 = w23 >> 8;
+    const uint32_t prev = __shfl_sync(0xffffffffu, b3, prev_lane);
+    const uint32_t s[4] = { (prev << 8) | b0, (b0 << 8) | b1, (b1 << 8) | b2, (b2 << 8) | b3 };
+    TqLane r;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+        r.q[i] = (int) ((uint32_t) s_lut[x >> 21] | ((uint32_t) s_lut[(x >> 10) & 2047u] << 16));
+    }
+    r.d = tq_h2f(STRATA_TQ_LD16(&b->d));
+    return r;
+}
+#endif
 __device__ __forceinline__ float tq_apply(const TqLane& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
     const int l = iqs / 4;
     const block_q8_1* b8 = bq8_1 + l / 2;
@@ -1004,6 +1025,17 @@ __device__ __forceinline__ void iq_sync_lds() {
 #endif
 }
 
+#if defined(__HIPCC__)
+// All IQ2/IQ3 grid tables contain strictly non-zero positive bytes in [1, 62], so ((g ^ m) + b) never carries
+// across bytes and is bitwise identical to __vsub4(g ^ signs, signs), replacing ~24 software-emulated byte-SIMD
+// instructions on AMD HIP with 5 single-cycle ALU ops and zero extra LDS.
+__device__ __forceinline__ int hip_iq_sign_nib4(uint32_t g, uint32_t nib) {
+    const uint32_t b = __umul24(nib & 0xFu, 0x204081u) & 0x01010101u;
+    const uint32_t m = (b << 8) - b;
+    return (int) ((g ^ m) + b);
+}
+#endif
+
 template<> inline constexpr bool kSplit<16> = true;
 template<> struct Split<16> {   // IQ2_XXS
     struct W { int g[8]; int ls; float dw; };
@@ -1020,11 +1052,18 @@ template<> struct Split<16> {   // IQ2_XXS
 #pragma unroll
         for (int k0 = 0; k0 < 8; k0 += 2) {
             const uint2 grid_pos = grid_lut[aux8[k0 / 2]];
+#if defined(__HIPCC__)
+            const uint32_t v = (aux32 >> (7 * k0 / 2)) & 0x7Fu;
+            const uint32_t sb = v | ((__popc(v) & 1u) << 7);
+            r.g[k0 + 0] = hip_iq_sign_nib4(grid_pos.x, sb);
+            r.g[k0 + 1] = hip_iq_sign_nib4(grid_pos.y, sb >> 4);
+#else
             const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             r.g[k0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             r.g[k0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         }
         r.ls = aux32 >> 27 | 1;
         r.dw = __half2float(bq2->d);
@@ -1089,11 +1128,18 @@ template<> struct Split<17> : SplitLs2 {   // IQ2_XS
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
             const uint2 grid_pos = grid_lut[q2[l0 / 2] & 0x1FF];
+#if defined(__HIPCC__)
+            const uint32_t v = (q2[l0 / 2] >> 9) & 0x7Fu;
+            const uint32_t sb = v | ((__popc(v) & 1u) << 7);
+            r.g[l0 + 0] = hip_iq_sign_nib4(grid_pos.x, sb);
+            r.g[l0 + 1] = hip_iq_sign_nib4(grid_pos.y, sb >> 4);
+#else
             const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             r.g[l0 + 0] = __vsub4(grid_pos.x ^ signs0, signs0);
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             r.g[l0 + 1] = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         }
         r.dw = __half2float(bq2->d);
         return r;
@@ -1109,19 +1155,25 @@ template<> struct Split<22> : SplitLs2 {   // IQ2_S
         const int qh = bq2->qh[iqs / 2];
         const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
         const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
-        const uint64_t* grid_lut;
-        if constexpr (STAGE_GRID) grid_lut = (const uint64_t*) s_grid;
-        else grid_lut = iq2s_grid;
+        const uint2* grid_lut;
+        if constexpr (STAGE_GRID) grid_lut = (const uint2*) s_grid;
+        else grid_lut = (const uint2*) iq2s_grid;
         W r;
         r.ls0 = bq2->scales[iqs / 2] & 0x0F;
         r.ls1 = bq2->scales[iqs / 2] >> 4;
 #pragma unroll
         for (int l0 = 0; l0 < 8; l0 += 2) {
-            const int* grid_pos = (const int*) (grid_lut + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
+            const uint2 gp = grid_lut[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+#if defined(__HIPCC__)
+            const uint32_t sb = signs_packed_8[l0 / 2];
+            r.g[l0 + 0] = hip_iq_sign_nib4(gp.x, sb);
+            r.g[l0 + 1] = hip_iq_sign_nib4(gp.y, sb >> 4);
+#else
             const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
             const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
-            r.g[l0 + 0] = __vsub4(grid_pos[0] ^ signs0, signs0);
-            r.g[l0 + 1] = __vsub4(grid_pos[1] ^ signs1, signs1);
+            r.g[l0 + 0] = __vsub4((int) gp.x ^ signs0, signs0);
+            r.g[l0 + 1] = __vsub4((int) gp.y ^ signs1, signs1);
+#endif
         }
         r.dw = __half2float(bq2->d);
         return r;
@@ -1894,12 +1946,28 @@ __device__ __forceinline__ void row_dot_160_sub8(const uint8_t* row, const block
     for (int v = 0; v < 4; ++v)
 #pragma unroll
         for (int c = 0; c < NC; ++c) p[v][c] = 0.0f;
+#if defined(__HIPCC__)
+    const int lane32 = threadIdx.x & 31;
+    const int prev_lane = (lane32 & ~7) | ((t + 7) & 7);
+#pragma unroll 1
+#else
 #pragma unroll
+#endif
     for (int j = 0; j < 5; ++j) {
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
             const int kbx = v + 4 * j, iqs = F::step * t;
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+            const typename S::W w = [&]() -> typename S::W {
+                if constexpr (TY == 144 && STAGE_GRID) {
+                    return tq2_load_shfl(row, kbx, t, prev_lane, (const uint16_t*) s_grid);
+                } else {
+                    return S::template load<STAGE_GRID>(row, kbx, iqs, s_grid);
+                }
+            }();
+#else
             const typename S::W w = S::template load<STAGE_GRID>(row, kbx, iqs, s_grid);
+#endif
 #pragma unroll
             for (int c = 0; c < NC; ++c)
                 if (EXACT_N || c < n) p[v][c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
@@ -1925,6 +1993,9 @@ __device__ __forceinline__ void row_dot2_80_sub16(const uint8_t* ra, const uint8
     using S = Split<TY>;
 #pragma unroll
     for (int c = 0; c < NC; ++c) { sa[c] = 0.0f; sb[c] = 0.0f; }
+#if defined(__HIPCC__)
+#pragma unroll 1
+#endif
     for (int k = t; k < 80; k += 32) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
         const typename S::W wa = S::template load<STAGE_GRID>(ra, kbx, iqs, s_grid);
@@ -1939,6 +2010,9 @@ __device__ __forceinline__ void row_dot2_80_sub16(const uint8_t* ra, const uint8
     float a16[NC], b16[NC];
 #pragma unroll
     for (int c = 0; c < NC; ++c) { a16[c] = 0.0f; b16[c] = 0.0f; }
+#if defined(__HIPCC__)
+#pragma unroll 1
+#endif
     for (int k = t + 16; k < 64; k += 32) {
         const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
         const typename S::W wa = S::template load<STAGE_GRID>(ra, kbx, iqs, s_grid);
@@ -3015,8 +3089,9 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
 
 // ---------------------------------------------------------------- EXPDEC-TQ2_T (STRATA_HIP_EXPDEC_TQ=1):
 // Gyro-M TQ2_T (144) on gfx1100 wave32: 4 KiB LDS codebook + planar 16-byte LDS activations (ed_stage_entry) +
-// R rows per 8-lane sub-warp + wave32 shuffle for the wrap-around prev byte (eliminates unaligned 1-byte load).
+// R rows per 8-lane sub-warp + wave32 shuffle for the wrap-around prev byte (tq2_load_shfl defined above).
 // Bitwise identical to row_dot_160_sub8 (gate/up) and row_dot_40_sub8 (down).
+#if !defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
 __device__ __forceinline__ TqLane tq2_load_shfl(const void* __restrict__ vbq, int kbx, int t, int prev_lane,
                                                 const uint16_t* __restrict__ s_lut) {
     const block_tq2_t* b = (const block_tq2_t*) vbq + kbx;
@@ -3034,6 +3109,7 @@ __device__ __forceinline__ TqLane tq2_load_shfl(const void* __restrict__ vbq, in
     r.d = tq_h2f(STRATA_TQ_LD16(&b->d));
     return r;
 }
+#endif
 __device__ __forceinline__ float tq_apply_u(const TqLane& r, const int4 u, float d8) {
     int sumi = 0;
     sumi = ggml_cuda_dp4a(r.q[0], u.x, sumi);

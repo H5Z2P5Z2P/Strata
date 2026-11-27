@@ -77,6 +77,7 @@
     "STRATA_HIP_EXPDEC_TQ_DOWN": "1",
     "STRATA_HIP_EXPDEC_TQ_DR": "4",
     "STRATA_HIP_HAD_FUSE": "1",
+    "STRATA_GR_FUSED": "1",
     "STRATA_ADAPT_OVERLAP": "1",
     "GPU_MAX_HW_QUEUES": "8"
   },

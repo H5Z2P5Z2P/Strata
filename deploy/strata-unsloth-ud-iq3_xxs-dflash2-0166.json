@@ -73,6 +73,7 @@
     "STRATA_VERIFY_QDEDUP": "1",
     "STRATA_Q6_PACKED": "0",
     "STRATA_Q8_PACKED": "1",
+    "STRATA_GR_FUSED": "1",
     "STRATA_ADAPT_OVERLAP": "1",
     "GPU_MAX_HW_QUEUES": "8"
   },

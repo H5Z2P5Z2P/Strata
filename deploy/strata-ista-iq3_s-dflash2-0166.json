@@ -72,6 +72,7 @@
     "STRATA_KV_HOST_DMA": "1",
     "STRATA_VERIFY_QDEDUP": "1",
     "STRATA_Q6_PACKED": "0",
+    "STRATA_GR_FUSED": "1",
     "STRATA_ADAPT_OVERLAP": "1",
     "GPU_MAX_HW_QUEUES": "8"
   },
