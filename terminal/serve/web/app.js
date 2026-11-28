@@ -174,7 +174,7 @@ $("metrics").innerHTML = METRICS.map((m) => `
   <div class="st-card metric-card${m.key === "model" ? " model-card" : ""}"><div class="st-metric">
     <span class="st-metric__label" id="ml-${m.key}"${m.hint ? ` title="${esc(m.hint)}"` : ""}>${icon(m.icon, "st-icon st-icon--sm")}${esc(m.label)}</span>
     ${m.key === "speed" ? `<div class="speed-values">
-      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span><span class="st-metric__sub speed-range" id="sr-speed"></span></div>
+      <div><span class="st-metric__value" id="mv-speed">-</span><span class="st-metric__sub" id="ms-speed">Decode</span><span class="st-metric__sub speed-range" id="sr-speed"></span><span class="st-metric__sub speed-range" id="sr-speed-real"></span></div>
       <div class="speed-prefill"><span class="st-metric__value" id="mv-prefill">-</span><span class="st-metric__sub" id="ms-prefill">Prefill</span><span class="st-metric__sub speed-range" id="sr-prefill"></span></div>
     </div>` : m.key === "model" ? `<span class="st-metric__value model-card__name" id="mv-model">–</span>
     <span class="st-metric__sub" id="ms-model"></span>` : `<span class="st-metric__value" id="mv-${m.key}">–</span>
@@ -440,14 +440,20 @@ function renderConvCache(c) {
     : "The engine keeps the last conversation's state, so a follow-up reads only what is new. To keep several conversations (agents taking turns), add \"--conversation-cache-mib\", \"8192\" to the run config's args (docs/DETAILS.md).";
 }
 
-function renderTotals(t) {
+function renderTotals(t, rs) {
   if (!t || !t.requests) return "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
-  const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
+  const dRate = rs ? rs.tok_s : (t.decode_ms > 0 && t.output_tokens > 0 ? t.output_tokens / (t.decode_ms / 1000) : null);
+  const oSpeed = dRate != null ? ` at ${fmt(dRate, 1)} tok/s` : "";
+  const hwBits = [];
+  if (rs && rs.ms_win != null) hwBits.push(`${fmt(rs.ms_win, 1)} ms/win`);
+  if (rs && rs.acc_pct != null) hwBits.push(`acc ${fmt(rs.acc_pct, 1)}%`);
+  else if (t.drafts_offered > 0) hwBits.push(`acc ${fmt((100 * (t.drafts_accepted || 0)) / t.drafts_offered, 1)}%`);
+  const extra = hwBits.length ? ` (${hwBits.join(" · ")})` : "";
   return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ` +
-         `${fmt(t.output_tokens)} written${oSpeed}`;
+         `${fmt(t.output_tokens)} written${oSpeed}${extra}`;
 }
 /* The machine's PCIe link for the PCIe card: with several cards the one with the slowest link (gpu_pcie_bottleneck, which the server names
    from ONE card: its generation, width and the generation it can reach), else the top-level fields (one card, or a server from before it).
@@ -486,6 +492,7 @@ async function pullSpeedWindow() {
     if (r.ok) for (const q of ((await r.json()).requests || [])) if (q.id != null) speedWin.set(q.id, q);
     speedWin = keepNewest(speedWin, SPEED_KEPT);
     fillSpeedRange();
+    fillRealDecode(null, null);
   } catch { /* the window stays as it is; the next polls add to it */ }
 }
 function fillSpeedRange() {
@@ -495,6 +502,60 @@ function fillSpeedRange() {
     el.textContent = r ? `min ${fmt(r.min, d)} · max ${fmt(r.max, d)}` : "";
     el.title = r ? `The slowest and the fastest of the last ${fmt(r.n)} requests. The server keeps up to 500.` : "";
   }
+}
+// Real engine decode metrics over the newest SPEED_KEPT valid requests (engine_generated >= 2, decode_ms > 0):
+// token-weighted engine decode tok/s, pure hardware verify-window latency (ms/win), and draft acceptance rate.
+function realDecodeStats(rows) {
+  let tokens = 0, ms = 0, n = 0, wins = 0, winMs = 0, winTok = 0, offered = 0, accepted = 0;
+  for (const r of rows) {
+    const gen = r.engine_generated != null ? r.engine_generated : r.output_tokens;
+    const dms = r.decode_ms;
+    if (!(gen >= 2) || !(dms > 0)) continue;
+    tokens += gen; ms += dms; n += 1;
+    if (r.drafts_accepted != null) {
+      const w = Math.max(1, gen - r.drafts_accepted);
+      wins += w; winMs += dms; winTok += gen;
+    }
+    if (r.drafts_offered > 0) {
+      offered += r.drafts_offered;
+      accepted += r.drafts_accepted || 0;
+    }
+  }
+  if (!(ms > 0) || !n) return null;
+  return {
+    tok_s: tokens / (ms / 1000),
+    ms_win: wins > 0 ? winMs / wins : null,
+    tok_win: wins > 0 ? winTok / wins : null,
+    acc_pct: offered > 0 ? (100 * accepted) / offered : null,
+    n, tokens, ms
+  };
+}
+function fillRealDecode(live, totals) {
+  const rs = realDecodeStats([...speedWin.values()]);
+  const el = $("sr-speed-real");
+  if (el) {
+    if (rs) {
+      const parts = [];
+      if (rs.ms_win != null) parts.push(`${fmt(rs.ms_win, 1)} ms/w`);
+      if (rs.acc_pct != null) parts.push(`acc ${fmt(rs.acc_pct, 1)}%`);
+      if (rs.tok_win != null) parts.push(`${fmt(rs.tok_win, 2)} t/w`);
+      el.textContent = parts.join(" · ");
+      const runAvg = totals && totals.decode_ms > 0 && totals.output_tokens > 0
+        ? ` | Since start: ${fmt(totals.output_tokens / (totals.decode_ms / 1000), 1)} t/s` : "";
+      el.title = `Real engine decode avg: ${fmt(rs.tok_s, 1)} t/s over last ${fmt(rs.n)} valid requests (${fmt(rs.tokens)} tokens, >=2 tok)${runAvg}.\n` +
+                 `ms/w = pure hardware time per verify window (independent of draft acceptance); acc = draft acceptance; t/w = tokens per window.`;
+    } else {
+      el.textContent = "";
+      el.title = "";
+    }
+  }
+  if (rs && live && live.state !== "generating") {
+    const runAvg = totals && totals.decode_ms > 0 && totals.output_tokens > 0
+      ? ` (since start: ${fmt(totals.output_tokens / (totals.decode_ms / 1000), 1)} t/s)` : "";
+    setMetric("speed", fmt(rs.tok_s, 1), "t/s", `Decode · real avg (${fmt(rs.n)})`,
+              `Token-weighted engine decode speed over the last ${fmt(rs.n)} valid requests (>=2 tokens, using engine_generated / decode_ms)${runAvg}.`);
+  }
+  return rs;
 }
 // Power and temperature averages (#4968): a sample is taken at each poll while the server is working (queued, reading or generating;
 // idle time is left out) and weighs the seconds since the poll before it, at most HW_GAP_S, so a page that polled less often (a
@@ -653,6 +714,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   for (const r of requests) if (r.id != null) speedWin.set(r.id, r);
   speedWin = keepNewest(speedWin, SPEED_KEPT);
   fillSpeedRange();
+  const realDec = fillRealDecode(live, totals);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
@@ -722,8 +784,20 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   const avg = [];
   if (totals && totals.requests) {
     const read = totals.prompt_tokens - totals.reused;
-    avg.push(["Decode avg", totals.decode_ms > 0 && totals.output_tokens ? `${fmt(totals.output_tokens / (totals.decode_ms / 1000), 1)} t/s` : "–",
-              "Average answer speed since the server started: answer tokens divided by the time spent writing them. Waiting in the queue and reading the prompt are not counted."]);
+    const decRate = realDec ? realDec.tok_s : (totals.decode_ms > 0 && totals.output_tokens ? totals.output_tokens / (totals.decode_ms / 1000) : null);
+    const runDecRate = totals.decode_ms > 0 && totals.output_tokens ? totals.output_tokens / (totals.decode_ms / 1000) : null;
+    avg.push(["Decode avg", decRate != null ? `${fmt(decRate, 1)} t/s` : "–",
+              realDec
+                ? `Real engine token-weighted decode average over the last ${fmt(realDec.n)} valid requests (${fmt(realDec.tokens)} tokens, excluding 1-token probes).` +
+                  (runDecRate != null ? ` Raw since-start totals: ${fmt(runDecRate, 1)} t/s.` : "")
+                : "Average answer speed since the server started: answer tokens divided by the time spent writing them. Waiting in the queue and reading the prompt are not counted."]);
+    if (realDec && (realDec.ms_win != null || realDec.acc_pct != null)) {
+      const parts = [];
+      if (realDec.ms_win != null) parts.push(`${fmt(realDec.ms_win, 1)} ms/w`);
+      if (realDec.acc_pct != null) parts.push(`${fmt(realDec.acc_pct, 1)}% acc`);
+      avg.push(["Window / Draft", parts.join(" · "),
+                `Pure hardware speed (${realDec.ms_win != null ? fmt(realDec.ms_win, 2) + " ms/window" : "–"}) and speculative draft acceptance (${realDec.acc_pct != null ? fmt(realDec.acc_pct, 1) + "%" : "–"}, ${realDec.tok_win != null ? fmt(realDec.tok_win, 2) + " tok/window" : "–"}) over the last ${fmt(realDec.n)} valid requests.`]);
+    }
     avg.push(["Prefill avg", totals.prompt_ms > 0 && read > 0 ? `${fmt(read / (totals.prompt_ms / 1000))} t/s` : "–",
               "Average prompt speed since the server started, counting only the tokens that were really read. What came from the cache is left out."]);
     avg.push(["Per request", `${fmt(totals.prompt_tokens / totals.requests)} in · ${fmt(totals.output_tokens / totals.requests, 1)} out`,
@@ -781,7 +855,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   all.hidden = kept <= 12;
   all.textContent = reqShowAll ? "Show fewer" : `Show all (${kept})`;
   $("req-wrap").classList.toggle("all", reqShowAll);
-  $("req-totals").textContent = renderTotals(totals);
+  $("req-totals").textContent = renderTotals(totals, realDec);
 }
 
 function facts(el, rows) {
